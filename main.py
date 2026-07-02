@@ -88,7 +88,6 @@ def grade_essay(req: GradeRequest):
             model="Qwen/Qwen3-32B",
             messages=messages,
             max_tokens=1500,
-            extra_body={"thinking": {"type": "disabled"}},
         )
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
