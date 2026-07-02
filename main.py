@@ -90,10 +90,18 @@ def grade_essay(req: GradeRequest):
             max_tokens=1500,
         )
         raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw.strip())
+# Remove thinking tags
+import re
+raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+# Remove markdown code blocks
+if "```" in raw:
+    raw = raw.split("```")[1]
+    if raw.startswith("json"):
+        raw = raw[4:]
+# Extract JSON object
+match = re.search(r'\{.*\}', raw, re.DOTALL)
+if match:
+    raw = match.group(0)
+return json.loads(raw.strip())
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
