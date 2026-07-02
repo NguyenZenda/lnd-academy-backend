@@ -73,14 +73,14 @@ def grade_essay(req: GradeRequest):
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": [
-                {"type": "text", "text": "Grade this IELTS Writing Task 1. The chart/graph image is attached below.\n\n" + user_content},
+                {"type": "text", "text": "Grade this IELTS Writing Task 1. The chart/graph image is attached below.\n\n" + user_content + "\n/no_think"},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{req.image_base64}"}}
             ]}
         ]
     else:
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Grade this IELTS Writing {req.task_type}:\n\n" + user_content}
+            {"role": "user", "content": f"Grade this IELTS Writing {req.task_type}:\n\n" + user_content + "\n/no_think"}
         ]
 
     try:
