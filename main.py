@@ -27,7 +27,7 @@ def grade_essay(req: GradeRequest):
     if len(req.essay.strip()) < 50:
         raise HTTPException(status_code=400, detail="Essay is too short")
 
-    client = InferenceClient(provider="groq", api_key=HF_TOKEN)
+    client = InferenceClient(provider="novita", api_key=HF_TOKEN)
 
     if req.task_type == "Task 1":
         criterion1 = "Task Achievement (TA)"
