@@ -1,9 +1,11 @@
+import os
+import json
+import re
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from huggingface_hub import InferenceClient
 from typing import Optional
-import os, json, base64
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -13,7 +15,7 @@ HF_TOKEN = os.environ.get("HF_TOKEN", "")
 class GradeRequest(BaseModel):
     essay: str
     prompt: str
-    task_type: str  # "Task 1" or "Task 2"
+    task_type: str
     image_base64: Optional[str] = None
 
 @app.get("/")
@@ -34,20 +36,20 @@ def grade_essay(req: GradeRequest):
         task_instruction = (
             "This is an IELTS Writing Task 1. The student was given a chart/graph/diagram "
             "and must describe its key features accurately. Check if the essay correctly "
-            "describes the data shown in the image and addresses the prompt."
+            "describes the data and addresses the prompt."
         )
     else:
         criterion1 = "Task Response (TR)"
         task_instruction = (
             "This is an IELTS Writing Task 2 argumentative essay. "
-            "Check if the essay fully addresses all parts of the prompt/question."
+            "Check if the essay fully addresses all parts of the prompt."
         )
 
     system_prompt = (
         "You are a certified IELTS examiner with 10+ years of experience. "
         + task_instruction +
         " Grade strictly following official IELTS Band Descriptors (0-9 scale, .5 increments allowed). "
-        "Respond ONLY in this exact JSON format, no extra text:\n"
+        "Respond ONLY in this exact JSON format, no extra text, no markdown:\n"
         "{\n"
         f'  "criterion1_name": "{criterion1}",\n'
         '  "criterion1_score": 7.0,\n'
@@ -67,21 +69,12 @@ def grade_essay(req: GradeRequest):
     )
 
     user_content = f"EXAM PROMPT:\n{req.prompt}\n\nSTUDENT ESSAY:\n{req.essay}"
+    user_message = f"Grade this IELTS Writing {req.task_type}:\n\n{user_content}\n/no_think"
 
-    # Build messages — include image for Task 1
-    if req.task_type == "Task 1" and req.image_base64:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [
-                {"type": "text", "text": "Grade this IELTS Writing Task 1. The chart/graph image is attached below.\n\n" + user_content + "\n/no_think"},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{req.image_base64}"}}
-            ]}
-        ]
-    else:
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Grade this IELTS Writing {req.task_type}:\n\n" + user_content + "\n/no_think"}
-        ]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message}
+    ]
 
     try:
         response = client.chat.completions.create(
@@ -89,19 +82,17 @@ def grade_essay(req: GradeRequest):
             messages=messages,
             max_tokens=1500,
         )
+
         raw = response.choices[0].message.content.strip()
-# Remove thinking tags
-import re
-raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-# Remove markdown code blocks
-if "```" in raw:
-    raw = raw.split("```")[1]
-    if raw.startswith("json"):
-        raw = raw[4:]
-# Extract JSON object
-match = re.search(r'\{.*\}', raw, re.DOTALL)
-if match:
-    raw = match.group(0)
-return json.loads(raw.strip())
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        return json.loads(raw.strip())
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
