@@ -587,6 +587,7 @@ class ExamCreateRequest(BaseModel):
     questions: List[ExamQuestionIn]
     groups: Optional[List[ExamGroupIn]] = None
     parts: Optional[List[ExamPartIn]] = None
+    is_full_test: bool = True
 
 
 EXAM_AUDIO_BUCKET = "exam-audio"
@@ -672,6 +673,7 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
         "skill": req.skill,
         "passage_text": req.passage_text,
         "audio_url": req.audio_url,
+        "is_full_test": req.is_full_test,
         "created_by": user["id"],
     }
     exam_res = supabase.table("exams").insert(exam_row).execute()
@@ -685,7 +687,7 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
 @app.get("/exams")
 def list_exams(skill: Optional[str] = None):
     require_supabase()
-    q = supabase.table("exams").select("id,title,skill,created_at").order("created_at", desc=True)
+    q = supabase.table("exams").select("id,title,skill,is_full_test,created_at").order("created_at", desc=True)
     if skill:
         q = q.eq("skill", skill)
     return q.execute().data
@@ -753,6 +755,7 @@ def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_u
         "skill": req.skill,
         "passage_text": req.passage_text,
         "audio_url": req.audio_url,
+        "is_full_test": req.is_full_test,
     }).eq("id", exam_id).execute()
 
     # Xoa cau hoi (con) truoc, roi nhom, roi parts (cha), sau do tao lai tu dau
