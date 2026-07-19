@@ -59,6 +59,25 @@ def get_current_user(authorization: Optional[str] = Header(None)):
     return {"id": user.id, "email": user.email, **profile.data}
 
 
+def get_optional_user(authorization: Optional[str] = Header(None)):
+    """Giong get_current_user nhung khong bao gio raise loi - tra None neu chua dang nhap/token sai.
+    Dung cho cac endpoint muon "mo cho khach" nhung van nhan biet duoc user da dang nhap (VD nop bai thi)."""
+    if not supabase or not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization.split(" ", 1)[1]
+    try:
+        user_resp = supabase.auth.get_user(token)
+        user = user_resp.user
+        if not user:
+            return None
+        profile = supabase.table("profiles").select("*").eq("id", user.id).single().execute()
+        if not profile.data:
+            return None
+        return {"id": user.id, "email": user.email, **profile.data}
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -509,6 +528,9 @@ def chat(req: ChatRequest):
 # ---------------------------------------------------------------------------
 import io
 from docx import Document as DocxDocument
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 
 def require_admin(user):
@@ -590,7 +612,21 @@ class ExamCreateRequest(BaseModel):
     is_full_test: bool = True
 
 
-EXAM_AUDIO_BUCKET = "exam-audio"
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+AUDIO_DRIVE_FOLDER_ID = os.environ.get("AUDIO_DRIVE_FOLDER_ID", "")
+
+
+def _get_drive_service():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình GOOGLE_SERVICE_ACCOUNT_JSON")
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="GOOGLE_SERVICE_ACCOUNT_JSON không phải JSON hợp lệ")
+    creds = service_account.Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/drive.file"]
+    )
+    return build("drive", "v3", credentials=creds)
 
 
 @app.post("/exams/upload-audio")
@@ -598,21 +634,38 @@ async def upload_exam_audio(file: UploadFile = File(...), user=Depends(get_curre
     require_admin(user)
     if not (file.filename or "").lower().endswith((".mp3", ".wav", ".m4a", ".ogg")):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file âm thanh (.mp3, .wav, .m4a, .ogg)")
+    if not AUDIO_DRIVE_FOLDER_ID:
+        raise HTTPException(status_code=500, detail="Chưa cấu hình AUDIO_DRIVE_FOLDER_ID")
 
     file_bytes = await file.read()
-    if len(file_bytes) > 30 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File âm thanh vượt quá 30MB")
+    if len(file_bytes) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File âm thanh vượt quá 100MB")
 
-    ext = os.path.splitext(file.filename or "")[1]
-    storage_path = f"{uuid.uuid4().hex}{ext}"
     try:
-        supabase.storage.from_(EXAM_AUDIO_BUCKET).upload(
-            storage_path, file_bytes, {"content-type": file.content_type or "audio/mpeg"}
+        service = _get_drive_service()
+        media = MediaIoBaseUpload(
+            io.BytesIO(file_bytes),
+            mimetype=file.content_type or "audio/mpeg",
+            resumable=False,
         )
-        public_url = supabase.storage.from_(EXAM_AUDIO_BUCKET).get_public_url(storage_path)
-        return {"audio_url": public_url}
+        file_metadata = {
+            "name": f"{uuid.uuid4().hex}_{file.filename}",
+            "parents": [AUDIO_DRIVE_FOLDER_ID],
+        }
+        created = service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        file_id = created["id"]
+
+        # Cho phep bat ky ai co link deu nghe/tai duoc (khong can dang nhap Google)
+        service.permissions().create(
+            fileId=file_id, body={"type": "anyone", "role": "reader"}
+        ).execute()
+
+        direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        return {"audio_url": direct_url}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Upload lên Google Drive thất bại: {e}")
 
 
 def _insert_parts_groups_questions(exam_id, req):
@@ -783,7 +836,7 @@ class ExamSubmitRequest(BaseModel):
 
 
 @app.post("/exams/{exam_id}/submit")
-def submit_exam(exam_id: str, req: ExamSubmitRequest):
+def submit_exam(exam_id: str, req: ExamSubmitRequest, user=Depends(get_optional_user)):
     require_supabase()
     questions = (
         supabase.table("exam_questions").select("*").eq("exam_id", exam_id)
@@ -826,9 +879,52 @@ def submit_exam(exam_id: str, req: ExamSubmitRequest):
         for label, s in section_stats.items()
     ]
 
+    # Neu da dang nhap, tu luu lai lich su lam bai (khong lam gian doan viec tra ket qua neu loi)
+    if user:
+        try:
+            supabase.table("exam_attempts").insert({
+                "exam_id": exam_id,
+                "user_id": user["id"],
+                "score": correct_count,
+                "total": len(questions),
+                "answers": req.answers,
+                "results": results,
+            }).execute()
+        except Exception:
+            pass
+
     return {
         "score": correct_count,
         "total": len(questions),
         "results": results,
         "section_breakdown": section_breakdown,
     }
+
+
+# ---------------------------------------------------------------------------
+# Lich su lam bai cua chinh user dang dang nhap
+# ---------------------------------------------------------------------------
+@app.get("/me/exam-attempts")
+def list_my_attempts(user=Depends(get_current_user)):
+    attempts = (
+        supabase.table("exam_attempts")
+        .select("id, exam_id, score, total, created_at, exams(title, skill, is_full_test)")
+        .eq("user_id", user["id"])
+        .order("created_at", desc=True)
+        .execute().data
+    )
+    return attempts
+
+
+@app.get("/me/exam-attempts/{attempt_id}")
+def get_my_attempt(attempt_id: str, user=Depends(get_current_user)):
+    attempt = (
+        supabase.table("exam_attempts")
+        .select("*, exams(title, skill, is_full_test)")
+        .eq("id", attempt_id)
+        .single()
+        .execute()
+    )
+    if not attempt.data or attempt.data["user_id"] != user["id"]:
+        raise HTTPException(status_code=404, detail="Không tìm thấy lịch sử làm bài")
+    return attempt.data
