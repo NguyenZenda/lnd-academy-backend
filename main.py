@@ -524,6 +524,7 @@ class ExamQuestionIn(BaseModel):
     correct_answer: str
     explanation: Optional[str] = None
     section_label: Optional[str] = None
+    group_ref: Optional[str] = None  # khop voi ExamGroupIn.temp_id, null neu cau doc lap
 
 
 @app.post("/exams/parse")
@@ -559,12 +560,21 @@ async def parse_exam(
     return {"passage_text": raw_text, "questions": []}
 
 
+class ExamGroupIn(BaseModel):
+    temp_id: str  # id tam client tu sinh, dung de gan question_ref -> group that sau khi tao
+    label: str
+    instructions_html: str = ""
+    word_bank: Optional[List[str]] = None
+    order_index: int = 0
+
+
 class ExamCreateRequest(BaseModel):
     title: str
     skill: str
     passage_text: str
     audio_url: Optional[str] = None
     questions: List[ExamQuestionIn]
+    groups: Optional[List[ExamGroupIn]] = None
 
 
 EXAM_AUDIO_BUCKET = "exam-audio"
@@ -610,6 +620,19 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
     exam_res = supabase.table("exams").insert(exam_row).execute()
     exam_id = exam_res.data[0]["id"]
 
+    group_id_map = {}
+    if req.groups:
+        group_rows = [{
+            "exam_id": exam_id,
+            "label": g.label,
+            "instructions_html": g.instructions_html,
+            "word_bank": g.word_bank,
+            "order_index": g.order_index,
+        } for g in req.groups]
+        group_res = supabase.table("exam_groups").insert(group_rows).execute()
+        for temp_group, real_group in zip(req.groups, group_res.data):
+            group_id_map[temp_group.temp_id] = real_group["id"]
+
     question_rows = [{
         "exam_id": exam_id,
         "question_number": q.question_number,
@@ -619,6 +642,7 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
         "correct_answer": q.correct_answer,
         "explanation": q.explanation,
         "section_label": q.section_label,
+        "group_id": group_id_map.get(q.group_ref) if q.group_ref else None,
     } for q in req.questions]
     supabase.table("exam_questions").insert(question_rows).execute()
 
@@ -646,7 +670,11 @@ def get_exam(exam_id: str):
     )
     for q in questions:
         q.pop("correct_answer", None)  # an dap an, khong lo lo cho hoc sinh
-    return {"exam": exam.data, "questions": questions}
+    groups = (
+        supabase.table("exam_groups").select("*").eq("exam_id", exam_id)
+        .order("order_index").execute().data
+    )
+    return {"exam": exam.data, "questions": questions, "groups": groups}
 
 
 @app.get("/exams/{exam_id}/edit")
@@ -660,7 +688,11 @@ def get_exam_for_edit(exam_id: str, user=Depends(get_current_user)):
         supabase.table("exam_questions").select("*").eq("exam_id", exam_id)
         .order("question_number").execute().data
     )
-    return {"exam": exam.data, "questions": questions}
+    groups = (
+        supabase.table("exam_groups").select("*").eq("exam_id", exam_id)
+        .order("order_index").execute().data
+    )
+    return {"exam": exam.data, "questions": questions, "groups": groups}
 
 
 @app.put("/exams/{exam_id}")
@@ -682,8 +714,22 @@ def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_u
         "audio_url": req.audio_url,
     }).eq("id", exam_id).execute()
 
-    # Xoa het cau hoi cu, ghi lai toan bo cau hoi moi (don gian, tranh phai doi-chieu tung cau)
+    # Xoa cau hoi (con) truoc, roi xoa nhom (cha), sau do tao lai tu dau - don gian, tranh doi-chieu tung cau
     supabase.table("exam_questions").delete().eq("exam_id", exam_id).execute()
+    supabase.table("exam_groups").delete().eq("exam_id", exam_id).execute()
+
+    group_id_map = {}
+    if req.groups:
+        group_rows = [{
+            "exam_id": exam_id,
+            "label": g.label,
+            "instructions_html": g.instructions_html,
+            "word_bank": g.word_bank,
+            "order_index": g.order_index,
+        } for g in req.groups]
+        group_res = supabase.table("exam_groups").insert(group_rows).execute()
+        for temp_group, real_group in zip(req.groups, group_res.data):
+            group_id_map[temp_group.temp_id] = real_group["id"]
 
     question_rows = [{
         "exam_id": exam_id,
@@ -694,6 +740,7 @@ def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_u
         "correct_answer": q.correct_answer,
         "explanation": q.explanation,
         "section_label": q.section_label,
+        "group_id": group_id_map.get(q.group_ref) if q.group_ref else None,
     } for q in req.questions]
     supabase.table("exam_questions").insert(question_rows).execute()
 
@@ -704,6 +751,7 @@ def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_u
 def delete_exam(exam_id: str, user=Depends(get_current_user)):
     require_admin(user)
     supabase.table("exam_questions").delete().eq("exam_id", exam_id).execute()
+    supabase.table("exam_groups").delete().eq("exam_id", exam_id).execute()
     supabase.table("exams").delete().eq("id", exam_id).execute()
     return {"status": "ok"}
 
