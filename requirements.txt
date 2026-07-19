@@ -1,6 +1,0 @@
-fastapi>=0.115.0
-uvicorn>=0.30.6
-huggingface_hub>=0.24.6
-pydantic[email]>=2.10.6
-python-multipart>=0.0.9
-supabase>=2.31.0
