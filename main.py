@@ -483,185 +483,6 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Content bot + QC bot (grounded in the marketing masterplan on Google Sheets)
-# ---------------------------------------------------------------------------
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-
-GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-MASTERPLAN_SHEET_ID = os.environ.get("MASTERPLAN_SHEET_ID", "")
-MASTERPLAN_CACHE_TTL = 600  # giay - tranh goi Google Sheets API lien tuc
-
-_masterplan_cache = {"text": None, "fetched_at": 0.0}
-
-
-def _get_sheets_service():
-    if not GOOGLE_SERVICE_ACCOUNT_JSON or not MASTERPLAN_SHEET_ID:
-        raise HTTPException(
-            status_code=500,
-            detail="Chua cau hinh GOOGLE_SERVICE_ACCOUNT_JSON / MASTERPLAN_SHEET_ID",
-        )
-    try:
-        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="GOOGLE_SERVICE_ACCOUNT_JSON khong phai JSON hop le")
-    creds = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"]
-    )
-    return build("sheets", "v4", credentials=creds)
-
-
-def _fetch_masterplan_text(max_chars: int = 6000) -> str:
-    service = _get_sheets_service()
-    sheet = service.spreadsheets()
-    try:
-        meta = sheet.get(spreadsheetId=MASTERPLAN_SHEET_ID).execute()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Khong doc duoc Google Sheet: {e}")
-
-    lines = []
-    for s in meta.get("sheets", []):
-        title = s["properties"]["title"]
-        try:
-            result = sheet.values().get(spreadsheetId=MASTERPLAN_SHEET_ID, range=title).execute()
-        except Exception:
-            continue
-        values = result.get("values", [])
-        if values:
-            lines.append(f"--- Sheet: {title} ---")
-        for row in values:
-            line = " | ".join(str(c) for c in row if str(c).strip())
-            if line.strip():
-                lines.append(line)
-
-    text = "\n".join(lines)
-    return text[:max_chars]
-
-
-def get_masterplan_text() -> str:
-    now = time.time()
-    if _masterplan_cache["text"] is None or (now - _masterplan_cache["fetched_at"]) > MASTERPLAN_CACHE_TTL:
-        _masterplan_cache["text"] = _fetch_masterplan_text()
-        _masterplan_cache["fetched_at"] = now
-    return _masterplan_cache["text"]
-
-
-PLATFORM_RULES = {
-    "facebook": "Viết bài đăng Facebook/Zalo: khoảng 80-150 từ, giọng gần gũi, có thể dùng emoji vừa phải, kết thúc bằng lời kêu gọi hành động rõ ràng (liên hệ hotline/Zalo).",
-    "blog": "Viết bài blog cho website: khoảng 400-700 từ, có tiêu đề, chia đoạn/heading phụ rõ ràng, giọng chuyên nghiệp nhưng dễ đọc.",
-}
-
-
-class ContentGenerateRequest(BaseModel):
-    platform: str  # "facebook" | "blog"
-    topic: str
-    notes: Optional[str] = None
-
-
-@app.post("/content/generate")
-def generate_content(req: ContentGenerateRequest, user=Depends(get_current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Chỉ giáo viên/quản trị mới dùng được công cụ này")
-    if req.platform not in PLATFORM_RULES:
-        raise HTTPException(status_code=400, detail="Nền tảng không hợp lệ")
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="HF_TOKEN not configured")
-
-    masterplan = get_masterplan_text()
-
-    system_prompt = f"""Bạn là chuyên viên content marketing của LND Academy — trung tâm tiếng Anh học thuật tại Lâm Đồng.
-Dựa vào kế hoạch truyền thông (masterplan) trích từ Google Sheets dưới đây, viết nội dung theo đúng định hướng, chủ đề chiến dịch và giọng văn thương hiệu hiện tại. KHÔNG bịa số liệu/ưu đãi/học phí không có trong masterplan hoặc không được cung cấp.
-
-KẾ HOẠCH TRUYỀN THÔNG:
-{masterplan}
-
-YÊU CẦU ĐỊNH DẠNG: {PLATFORM_RULES[req.platform]}
-"""
-    user_msg = f"Chủ đề/brief: {req.topic}"
-    if req.notes:
-        user_msg += f"\nGhi chú thêm: {req.notes}"
-    user_msg += "\n/no_think"
-
-    client = InferenceClient(provider="nscale", api_key=HF_TOKEN)
-    try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-32B",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=1200,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        return {"draft": raw}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class ContentQCRequest(BaseModel):
-    platform: str
-    content: str
-
-
-@app.post("/content/qc")
-def qc_content(req: ContentQCRequest, user=Depends(get_current_user)):
-    if user["role"] != "teacher":
-        raise HTTPException(status_code=403, detail="Chỉ giáo viên/quản trị mới dùng được công cụ này")
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="HF_TOKEN not configured")
-
-    masterplan = get_masterplan_text()
-    length_rule = {
-        "facebook": "80-150 từ cho bài Facebook/Zalo",
-        "blog": "400-700 từ cho bài blog",
-    }.get(req.platform, "độ dài phù hợp nền tảng")
-
-    system_prompt = f"""Bạn là chuyên viên Quality Control (QC) nội dung marketing của LND Academy.
-Kiểm tra bài viết dưới đây theo các tiêu chí:
-1. Giọng văn có nhất quán với thương hiệu LND Academy không (đối chiếu với masterplan bên dưới).
-2. Có thông tin nào bị bịa đặt (học phí, ưu đãi, cam kết đầu ra) không nằm trong masterplan/dữ liệu đã biết không.
-3. Chính tả và ngữ pháp tiếng Việt có lỗi không (liệt kê cụ thể nếu có).
-4. Độ dài có phù hợp không: {length_rule}.
-
-KẾ HOẠCH TRUYỀN THÔNG (tham chiếu):
-{masterplan}
-
-Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào khác, không dùng markdown:
-{{
-  "passed": true hoặc false,
-  "tone_issues": "mô tả vấn đề giọng văn nếu có, để chuỗi rỗng nếu ổn",
-  "factual_issues": "mô tả thông tin bị bịa/nghi vấn nếu có, để chuỗi rỗng nếu ổn",
-  "grammar_issues": "liệt kê lỗi chính tả/ngữ pháp cụ thể nếu có, để chuỗi rỗng nếu ổn",
-  "length_issue": "nhận xét về độ dài nếu không phù hợp, để chuỗi rỗng nếu ổn",
-  "overall_feedback": "nhận xét tổng quan ngắn gọn 1-2 câu"
-}}"""
-    user_msg = f"BÀI VIẾT CẦN KIỂM TRA (nền tảng: {req.platform}):\n\n{req.content}\n/no_think"
-
-    client = InferenceClient(provider="nscale", api_key=HF_TOKEN)
-    try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-32B",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            max_tokens=800,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
-        return json.loads(raw.strip())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 # ---------------------------------------------------------------------------
 # Exam bank (Reading/Listening, MCQ + short answer) — admin uploads, students take
@@ -766,7 +587,33 @@ class ExamCreateRequest(BaseModel):
     title: str
     skill: str
     passage_text: str
+    audio_url: Optional[str] = None
     questions: List[ExamQuestionIn]
+
+
+EXAM_AUDIO_BUCKET = "exam-audio"
+
+
+@app.post("/exams/upload-audio")
+async def upload_exam_audio(file: UploadFile = File(...), user=Depends(get_current_user)):
+    require_admin(user)
+    if not (file.filename or "").lower().endswith((".mp3", ".wav", ".m4a", ".ogg")):
+        raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file âm thanh (.mp3, .wav, .m4a, .ogg)")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 30 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File âm thanh vượt quá 30MB")
+
+    ext = os.path.splitext(file.filename or "")[1]
+    storage_path = f"{uuid.uuid4().hex}{ext}"
+    try:
+        supabase.storage.from_(EXAM_AUDIO_BUCKET).upload(
+            storage_path, file_bytes, {"content-type": file.content_type or "audio/mpeg"}
+        )
+        public_url = supabase.storage.from_(EXAM_AUDIO_BUCKET).get_public_url(storage_path)
+        return {"audio_url": public_url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/exams")
@@ -781,6 +628,7 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
         "title": req.title,
         "skill": req.skill,
         "passage_text": req.passage_text,
+        "audio_url": req.audio_url,
         "created_by": user["id"],
     }
     exam_res = supabase.table("exams").insert(exam_row).execute()
