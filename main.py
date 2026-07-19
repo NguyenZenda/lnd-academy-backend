@@ -117,10 +117,30 @@ def login(req: LoginRequest):
         profile = supabase.table("profiles").select("*").eq("id", resp.user.id).single().execute()
         return {
             "access_token": resp.session.access_token,
+            "refresh_token": resp.session.refresh_token,
+            "expires_at": resp.session.expires_at,
             "user": {"id": resp.user.id, "email": resp.user.email, **(profile.data or {})},
         }
     except Exception:
         raise HTTPException(status_code=401, detail="Email hoặc mật khẩu không đúng")
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@app.post("/auth/refresh")
+def refresh_session(req: RefreshRequest):
+    require_supabase()
+    try:
+        resp = supabase.auth.refresh_session(req.refresh_token)
+        return {
+            "access_token": resp.session.access_token,
+            "refresh_token": resp.session.refresh_token,
+            "expires_at": resp.session.expires_at,
+        }
+    except Exception:
+        raise HTTPException(status_code=401, detail="Không thể làm mới phiên đăng nhập, vui lòng đăng nhập lại")
 
 
 @app.get("/me")
