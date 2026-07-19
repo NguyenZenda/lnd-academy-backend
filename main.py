@@ -649,6 +649,65 @@ def get_exam(exam_id: str):
     return {"exam": exam.data, "questions": questions}
 
 
+@app.get("/exams/{exam_id}/edit")
+def get_exam_for_edit(exam_id: str, user=Depends(get_current_user)):
+    """Giong get_exam nhung KHONG an dap an - chi admin dung de sua de thi."""
+    require_admin(user)
+    exam = supabase.table("exams").select("*").eq("id", exam_id).single().execute()
+    if not exam.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy đề thi")
+    questions = (
+        supabase.table("exam_questions").select("*").eq("exam_id", exam_id)
+        .order("question_number").execute().data
+    )
+    return {"exam": exam.data, "questions": questions}
+
+
+@app.put("/exams/{exam_id}")
+def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_user)):
+    require_admin(user)
+    if req.skill not in ("reading", "listening"):
+        raise HTTPException(status_code=400, detail="Kỹ năng không hợp lệ")
+    if not req.questions:
+        raise HTTPException(status_code=400, detail="Đề thi cần có ít nhất 1 câu hỏi")
+
+    existing = supabase.table("exams").select("id").eq("id", exam_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy đề thi")
+
+    supabase.table("exams").update({
+        "title": req.title,
+        "skill": req.skill,
+        "passage_text": req.passage_text,
+        "audio_url": req.audio_url,
+    }).eq("id", exam_id).execute()
+
+    # Xoa het cau hoi cu, ghi lai toan bo cau hoi moi (don gian, tranh phai doi-chieu tung cau)
+    supabase.table("exam_questions").delete().eq("exam_id", exam_id).execute()
+
+    question_rows = [{
+        "exam_id": exam_id,
+        "question_number": q.question_number,
+        "question_type": q.question_type,
+        "question_text": q.question_text,
+        "options": q.options,
+        "correct_answer": q.correct_answer,
+        "explanation": q.explanation,
+        "section_label": q.section_label,
+    } for q in req.questions]
+    supabase.table("exam_questions").insert(question_rows).execute()
+
+    return {"status": "ok", "exam_id": exam_id}
+
+
+@app.delete("/exams/{exam_id}")
+def delete_exam(exam_id: str, user=Depends(get_current_user)):
+    require_admin(user)
+    supabase.table("exam_questions").delete().eq("exam_id", exam_id).execute()
+    supabase.table("exams").delete().eq("id", exam_id).execute()
+    return {"status": "ok"}
+
+
 class ExamSubmitRequest(BaseModel):
     answers: dict  # {question_id: cau_tra_loi}
 
