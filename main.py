@@ -502,6 +502,8 @@ class ExamQuestionIn(BaseModel):
     question_text: str
     options: Optional[List[str]] = None
     correct_answer: str
+    explanation: Optional[str] = None
+    section_label: Optional[str] = None
 
 
 @app.post("/exams/parse")
@@ -510,13 +512,13 @@ async def parse_exam(
     file: UploadFile = File(...),
     user=Depends(get_current_user),
 ):
+    """Trich xuat text tho tu file docx, KHONG dung AI, KHONG tu doan cau hoi/dap an.
+    Admin tu nhap tung cau hoi + dap an thu cong o buoc sau."""
     require_admin(user)
     if skill not in ("reading", "listening"):
         raise HTTPException(status_code=400, detail="Kỹ năng không hợp lệ")
     if not (file.filename or "").lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file .docx")
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="HF_TOKEN not configured")
 
     content = await file.read()
     try:
@@ -531,56 +533,10 @@ async def parse_exam(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Không đọc được file docx: {e}")
 
-    if len(raw_text.strip()) < 30:
+    if len(raw_text.strip()) < 10:
         raise HTTPException(status_code=400, detail="File docx không có nội dung hoặc quá ngắn")
 
-    system_prompt = """Bạn là công cụ trích xuất đề thi IELTS từ văn bản thô (lấy ra từ file Word).
-Nhiệm vụ: đọc văn bản, tách riêng phần bài đọc/bài nghe (passage/transcript) và danh sách câu hỏi kèm đáp án đúng.
-
-Chỉ hỗ trợ 2 dạng câu hỏi:
-- "mcq": trắc nghiệm nhiều lựa chọn, có field "options" là danh sách các lựa chọn (KHÔNG bao gồm ký tự A/B/C/D ở đầu mỗi lựa chọn).
-- "short_answer": điền từ/câu trả lời ngắn, KHÔNG có field "options" (để null).
-
-Nếu văn bản có đáp án/answer key tách riêng ở cuối, tự khớp đúng đáp án vào từng câu hỏi tương ứng theo đúng số thứ tự.
-
-QUAN TRỌNG: Nếu KHÔNG tìm thấy đáp án cho 1 câu hỏi nào đó trong văn bản (đề không kèm đáp án), để "correct_answer" là chuỗi rỗng "". TUYỆT ĐỐI không tự bịa/đoán đáp án khi không có căn cứ trong văn bản gốc.
-
-Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào khác, không dùng markdown:
-{
-  "passage_text": "toàn bộ đoạn văn / transcript bài đọc hoặc bài nghe",
-  "questions": [
-    {
-      "question_number": 1,
-      "question_type": "mcq",
-      "question_text": "...",
-      "options": ["...", "...", "...", "..."],
-      "correct_answer": "..."
-    }
-  ]
-}"""
-
-    client = InferenceClient(provider="nscale", api_key=HF_TOKEN)
-    try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-32B",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": raw_text[:12000] + "\n/no_think"},
-            ],
-            max_tokens=4000,
-        )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
-        return json.loads(raw.strip())
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi khi phân tích đề thi: {e}")
+    return {"passage_text": raw_text, "questions": []}
 
 
 class ExamCreateRequest(BaseModel):
@@ -641,6 +597,8 @@ def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
         "question_text": q.question_text,
         "options": q.options,
         "correct_answer": q.correct_answer,
+        "explanation": q.explanation,
+        "section_label": q.section_label,
     } for q in req.questions]
     supabase.table("exam_questions").insert(question_rows).execute()
 
@@ -687,6 +645,8 @@ def submit_exam(exam_id: str, req: ExamSubmitRequest):
 
     results = []
     correct_count = 0
+    section_stats = {}  # {label: {"correct": n, "total": n}}
+
     for q in questions:
         qid = q["id"]
         user_answer = (req.answers.get(qid) or "").strip()
@@ -694,12 +654,32 @@ def submit_exam(exam_id: str, req: ExamSubmitRequest):
         is_correct = user_answer.lower() == correct_answer.lower()
         if is_correct:
             correct_count += 1
+
+        label = q.get("section_label") or "Chung"
+        section_stats.setdefault(label, {"correct": 0, "total": 0})
+        section_stats[label]["total"] += 1
+        if is_correct:
+            section_stats[label]["correct"] += 1
+
         results.append({
             "question_id": qid,
             "question_number": q["question_number"],
+            "question_text": q["question_text"],
             "your_answer": user_answer,
             "correct_answer": correct_answer,
             "is_correct": is_correct,
+            "explanation": q.get("explanation") or "",
+            "section_label": q.get("section_label") or "",
         })
 
-    return {"score": correct_count, "total": len(questions), "results": results}
+    section_breakdown = [
+        {"label": label, "correct": s["correct"], "total": s["total"]}
+        for label, s in section_stats.items()
+    ]
+
+    return {
+        "score": correct_count,
+        "total": len(questions),
+        "results": results,
+        "section_breakdown": section_breakdown,
+    }
