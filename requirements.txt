@@ -1,0 +1,9 @@
+fastapi>=0.115.0
+uvicorn>=0.30.6
+huggingface_hub>=0.24.6
+pydantic[email]>=2.10.6
+python-multipart>=0.0.9
+supabase>=2.31.0
+google-api-python-client>=2.149.0
+google-auth>=2.35.0
+python-docx>=1.1.2
