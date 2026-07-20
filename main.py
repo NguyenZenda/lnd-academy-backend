@@ -928,3 +928,219 @@ def get_my_attempt(attempt_id: str, user=Depends(get_current_user)):
     if not attempt.data or attempt.data["user_id"] != user["id"]:
         raise HTTPException(status_code=404, detail="Không tìm thấy lịch sử làm bài")
     return attempt.data
+
+
+# ---------------------------------------------------------------------------
+# Dictation (nghe chép chính tả, tự tách câu từ transcript YouTube - mien phi)
+# ---------------------------------------------------------------------------
+import re as _re_dictation
+from youtube_transcript_api import YouTubeTranscriptApi
+
+
+def extract_youtube_id(url: str) -> str:
+    patterns = [
+        r"(?:youtu\.be/)([A-Za-z0-9_-]{11})",
+        r"(?:v=)([A-Za-z0-9_-]{11})",
+        r"(?:embed/)([A-Za-z0-9_-]{11})",
+        r"(?:shorts/)([A-Za-z0-9_-]{11})",
+    ]
+    for p in patterns:
+        m = _re_dictation.search(p, url)
+        if m:
+            return m.group(1)
+    # Neu nguoi dung dan thang video ID (11 ky tu, khong co dau /)
+    if _re_dictation.fullmatch(r"[A-Za-z0-9_-]{11}", url.strip()):
+        return url.strip()
+    raise HTTPException(status_code=400, detail="Không nhận diện được video ID từ link YouTube")
+
+
+def _build_word_timeline(transcript):
+    timeline = []
+    for seg in transcript:
+        text = seg["text"].replace("\n", " ").strip()
+        if not text:
+            continue
+        words = text.split()
+        if not words:
+            continue
+        seg_start = seg["start"]
+        seg_dur = max(seg["duration"], 0.1)
+        per_word = seg_dur / len(words)
+        for i, w in enumerate(words):
+            timeline.append({"word": w, "time": seg_start + i * per_word})
+    return timeline
+
+
+def _split_into_sentences(timeline):
+    sentences = []
+    buffer = []
+    sent_start = None
+    for item in timeline:
+        if sent_start is None:
+            sent_start = item["time"]
+        buffer.append(item)
+        if _re_dictation.search(r'[.?!]["\')]*$', item["word"]):
+            text = " ".join(w["word"] for w in buffer)
+            end_time = item["time"] + 1.2  # them dem de audio khong bi cat ngang tu cuoi
+            sentences.append({"text": text, "start_time": round(sent_start, 2), "end_time": round(end_time, 2)})
+            buffer = []
+            sent_start = None
+    if buffer:
+        text = " ".join(w["word"] for w in buffer)
+        sentences.append({
+            "text": text,
+            "start_time": round(sent_start, 2),
+            "end_time": round(buffer[-1]["time"] + 1.2, 2),
+        })
+    for i, s in enumerate(sentences):
+        s["sentence_number"] = i + 1
+    return sentences
+
+
+class DictationTranscriptRequest(BaseModel):
+    youtube_url: str
+
+
+@app.post("/dictation/fetch-transcript")
+def fetch_dictation_transcript(req: DictationTranscriptRequest, user=Depends(get_current_user)):
+    require_admin(user)
+    video_id = extract_youtube_id(req.youtube_url)
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Không lấy được transcript (video có thể không có phụ đề tiếng Anh, hoặc bị chặn phụ đề): {e}",
+        )
+
+    if not transcript:
+        raise HTTPException(status_code=400, detail="Video này không có transcript")
+
+    timeline = _build_word_timeline(transcript)
+    sentences = _split_into_sentences(timeline)
+    total_duration = transcript[-1]["start"] + transcript[-1]["duration"]
+
+    return {
+        "video_id": video_id,
+        "sentences": sentences,
+        "duration_seconds": round(total_duration),
+        "sentence_count": len(sentences),
+    }
+
+
+class DictationSentenceIn(BaseModel):
+    sentence_number: int
+    text: str
+    start_time: float
+    end_time: float
+
+
+class DictationLessonCreateRequest(BaseModel):
+    title: str
+    youtube_video_id: str
+    level: Optional[str] = None
+    sentences: List[DictationSentenceIn]
+
+
+@app.post("/dictation/lessons")
+def create_dictation_lesson(req: DictationLessonCreateRequest, user=Depends(get_current_user)):
+    require_admin(user)
+    if not req.sentences:
+        raise HTTPException(status_code=400, detail="Bài dictation cần có ít nhất 1 câu")
+
+    duration = max((s.end_time for s in req.sentences), default=0)
+    lesson_row = {
+        "title": req.title,
+        "youtube_video_id": req.youtube_video_id,
+        "level": req.level,
+        "duration_seconds": round(duration),
+        "sentence_count": len(req.sentences),
+        "created_by": user["id"],
+    }
+    lesson_res = supabase.table("dictation_lessons").insert(lesson_row).execute()
+    lesson_id = lesson_res.data[0]["id"]
+
+    sentence_rows = [{
+        "lesson_id": lesson_id,
+        "sentence_number": s.sentence_number,
+        "text": s.text,
+        "start_time": s.start_time,
+        "end_time": s.end_time,
+    } for s in req.sentences]
+    supabase.table("dictation_sentences").insert(sentence_rows).execute()
+
+    return {"status": "ok", "lesson_id": lesson_id}
+
+
+@app.put("/dictation/lessons/{lesson_id}")
+def update_dictation_lesson(lesson_id: str, req: DictationLessonCreateRequest, user=Depends(get_current_user)):
+    require_admin(user)
+    existing = supabase.table("dictation_lessons").select("id").eq("id", lesson_id).single().execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bài dictation")
+
+    duration = max((s.end_time for s in req.sentences), default=0)
+    supabase.table("dictation_lessons").update({
+        "title": req.title,
+        "youtube_video_id": req.youtube_video_id,
+        "level": req.level,
+        "duration_seconds": round(duration),
+        "sentence_count": len(req.sentences),
+    }).eq("id", lesson_id).execute()
+
+    supabase.table("dictation_sentences").delete().eq("lesson_id", lesson_id).execute()
+    sentence_rows = [{
+        "lesson_id": lesson_id,
+        "sentence_number": s.sentence_number,
+        "text": s.text,
+        "start_time": s.start_time,
+        "end_time": s.end_time,
+    } for s in req.sentences]
+    supabase.table("dictation_sentences").insert(sentence_rows).execute()
+
+    return {"status": "ok", "lesson_id": lesson_id}
+
+
+@app.get("/dictation/lessons")
+def list_dictation_lessons(level: Optional[str] = None):
+    require_supabase()
+    q = supabase.table("dictation_lessons").select(
+        "id,title,youtube_video_id,level,duration_seconds,sentence_count,created_at"
+    ).order("created_at", desc=True)
+    if level:
+        q = q.eq("level", level)
+    return q.execute().data
+
+
+@app.get("/dictation/lessons/{lesson_id}")
+def get_dictation_lesson(lesson_id: str):
+    require_supabase()
+    lesson = supabase.table("dictation_lessons").select("*").eq("id", lesson_id).single().execute()
+    if not lesson.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bài dictation")
+    sentences = (
+        supabase.table("dictation_sentences").select("*").eq("lesson_id", lesson_id)
+        .order("sentence_number").execute().data
+    )
+    return {"lesson": lesson.data, "sentences": sentences}
+
+
+@app.get("/dictation/lessons/{lesson_id}/edit")
+def get_dictation_lesson_for_edit(lesson_id: str, user=Depends(get_current_user)):
+    require_admin(user)
+    lesson = supabase.table("dictation_lessons").select("*").eq("id", lesson_id).single().execute()
+    if not lesson.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy bài dictation")
+    sentences = (
+        supabase.table("dictation_sentences").select("*").eq("lesson_id", lesson_id)
+        .order("sentence_number").execute().data
+    )
+    return {"lesson": lesson.data, "sentences": sentences}
+
+
+@app.delete("/dictation/lessons/{lesson_id}")
+def delete_dictation_lesson(lesson_id: str, user=Depends(get_current_user)):
+    require_admin(user)
+    supabase.table("dictation_sentences").delete().eq("lesson_id", lesson_id).execute()
+    supabase.table("dictation_lessons").delete().eq("id", lesson_id).execute()
+    return {"status": "ok"}
