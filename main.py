@@ -936,6 +936,22 @@ def get_my_attempt(attempt_id: str, user=Depends(get_current_user)):
 import re as _re_dictation
 from youtube_transcript_api import YouTubeTranscriptApi
 
+WEBSHARE_PROXY_USERNAME = os.environ.get("WEBSHARE_PROXY_USERNAME", "")
+WEBSHARE_PROXY_PASSWORD = os.environ.get("WEBSHARE_PROXY_PASSWORD", "")
+
+
+def _get_youtube_transcript_api():
+    """Neu co cau hinh proxy Webshare thi dung, de tranh bi YouTube chan IP cua server cloud (Render)."""
+    if WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        return YouTubeTranscriptApi(
+            proxy_config=WebshareProxyConfig(
+                proxy_username=WEBSHARE_PROXY_USERNAME,
+                proxy_password=WEBSHARE_PROXY_PASSWORD,
+            )
+        )
+    return YouTubeTranscriptApi()
+
 
 def extract_youtube_id(url: str) -> str:
     patterns = [
@@ -1006,7 +1022,7 @@ def fetch_dictation_transcript(req: DictationTranscriptRequest, user=Depends(get
     require_admin(user)
     video_id = extract_youtube_id(req.youtube_url)
     try:
-        ytt_api = YouTubeTranscriptApi()
+        ytt_api = _get_youtube_transcript_api()
         fetched = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
         transcript = fetched.to_raw_data()
     except Exception as e:
