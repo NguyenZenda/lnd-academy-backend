@@ -1006,7 +1006,9 @@ def fetch_dictation_transcript(req: DictationTranscriptRequest, user=Depends(get
     require_admin(user)
     video_id = extract_youtube_id(req.youtube_url)
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["en", "en-US", "en-GB"])
+        ytt_api = YouTubeTranscriptApi()
+        fetched = ytt_api.fetch(video_id, languages=["en", "en-US", "en-GB"])
+        transcript = fetched.to_raw_data()
     except Exception as e:
         raise HTTPException(
             status_code=400,
