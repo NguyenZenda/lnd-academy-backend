@@ -1144,3 +1144,44 @@ def delete_dictation_lesson(lesson_id: str, user=Depends(get_current_user)):
     supabase.table("dictation_sentences").delete().eq("lesson_id", lesson_id).execute()
     supabase.table("dictation_lessons").delete().eq("id", lesson_id).execute()
     return {"status": "ok"}
+
+
+class DictationResultIn(BaseModel):
+    sentence_number: int
+    is_correct: bool
+    your_answer: str
+    correct_text: str
+
+
+class DictationSubmitRequest(BaseModel):
+    correct_count: int
+    total: int
+    results: List[DictationResultIn]
+
+
+@app.post("/dictation/lessons/{lesson_id}/submit")
+def submit_dictation(lesson_id: str, req: DictationSubmitRequest, user=Depends(get_optional_user)):
+    if user:
+        try:
+            supabase.table("dictation_attempts").insert({
+                "lesson_id": lesson_id,
+                "user_id": user["id"],
+                "correct_count": req.correct_count,
+                "total": req.total,
+                "results": [r.dict() for r in req.results],
+            }).execute()
+        except Exception:
+            pass
+    return {"status": "ok"}
+
+
+@app.get("/me/dictation-attempts")
+def list_my_dictation_attempts(user=Depends(get_current_user)):
+    attempts = (
+        supabase.table("dictation_attempts")
+        .select("id, lesson_id, correct_count, total, created_at, dictation_lessons(title, level)")
+        .eq("user_id", user["id"])
+        .order("created_at", desc=True)
+        .execute().data
+    )
+    return attempts
