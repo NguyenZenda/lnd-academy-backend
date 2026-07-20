@@ -171,23 +171,25 @@ def me(user=Depends(get_current_user)):
 # Documents (IELTS / HSCA / THPT libraries)
 # ---------------------------------------------------------------------------
 @app.get("/documents")
-def list_documents(category: str, subject: Optional[str] = None, grade: Optional[str] = None):
+def list_documents(category: str, skill: Optional[str] = None, levels: Optional[str] = None):
     require_supabase()
     if category not in ALLOWED_CATEGORIES:
         raise HTTPException(status_code=400, detail="Danh mục không hợp lệ")
     q = supabase.table("documents").select("*").eq("category", category).order("created_at", desc=True)
-    if subject:
-        q = q.eq("subject", subject)
-    if grade:
-        q = q.eq("grade", grade)
-    return q.execute().data
+    if skill:
+        q = q.eq("skill", skill)
+    docs = q.execute().data
+    if levels:
+        wanted = set(levels.split(","))
+        docs = [d for d in docs if wanted & set(d.get("cefr_levels") or [])]
+    return docs
 
 
 @app.post("/documents/upload")
 async def upload_document(
     category: str = Form(...),
-    subject: str = Form(""),
-    grade: str = Form(""),
+    skill: str = Form(""),
+    cefr_levels: str = Form(""),  # chuoi JSON list, vd ["B1","B2"]
     title: str = Form(...),
     file: UploadFile = File(...),
     user=Depends(get_current_user),
@@ -196,6 +198,11 @@ async def upload_document(
         raise HTTPException(status_code=403, detail="Chỉ giáo viên mới được đăng tài liệu")
     if category not in ALLOWED_CATEGORIES:
         raise HTTPException(status_code=400, detail="Danh mục không hợp lệ")
+
+    try:
+        levels_list = json.loads(cefr_levels) if cefr_levels else []
+    except json.JSONDecodeError:
+        levels_list = []
 
     file_bytes = await file.read()
     if len(file_bytes) > 20 * 1024 * 1024:
@@ -215,8 +222,8 @@ async def upload_document(
         row = {
             "title": title,
             "category": category,
-            "subject": subject,
-            "grade": grade,
+            "skill": skill,
+            "cefr_levels": levels_list,
             "file_url": public_url,
             "file_name": file.filename,
             "uploaded_by": user["id"],
@@ -994,8 +1001,12 @@ def _build_word_timeline(transcript):
         seg_dur = max(seg["duration"], 0.1)
         per_word = seg_dur / len(words)
         for i, w in enumerate(words):
-            timeline.append({"word": w, "time": seg_start + i * per_word})
+            word_start = seg_start + i * per_word
+            timeline.append({"word": w, "time": word_start, "end": word_start + per_word})
     return timeline
+
+
+_SENTENCE_END_BUFFER = 0.35  # dem nho, chi du de khong cat cut am cuoi, tranh tran qua cau sau
 
 
 def _split_into_sentences(timeline, min_words=_MIN_WORDS_PER_SENTENCE):
@@ -1011,7 +1022,7 @@ def _split_into_sentences(timeline, min_words=_MIN_WORDS_PER_SENTENCE):
             if len(buffer) < min_words:
                 continue
             text = " ".join(w["word"] for w in buffer)
-            end_time = item["time"] + 1.2  # them dem de audio khong bi cat ngang tu cuoi
+            end_time = item["end"] + _SENTENCE_END_BUFFER  # dung diem KET THUC that cua tu cuoi, khong phai diem bat dau
             sentences.append({"text": text, "start_time": round(sent_start, 2), "end_time": round(end_time, 2)})
             buffer = []
             sent_start = None
@@ -1020,7 +1031,7 @@ def _split_into_sentences(timeline, min_words=_MIN_WORDS_PER_SENTENCE):
         sentences.append({
             "text": text,
             "start_time": round(sent_start, 2),
-            "end_time": round(buffer[-1]["time"] + 1.2, 2),
+            "end_time": round(buffer[-1]["end"] + _SENTENCE_END_BUFFER, 2),
         })
     for i, s in enumerate(sentences):
         s["sentence_number"] = i + 1
