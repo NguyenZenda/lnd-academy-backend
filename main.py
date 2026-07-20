@@ -970,10 +970,21 @@ def extract_youtube_id(url: str) -> str:
     raise HTTPException(status_code=400, detail="Không nhận diện được video ID từ link YouTube")
 
 
+_CAPTION_NOISE_RE = _re_dictation.compile(r'\[[^\]]*\]|\([^)]*\)|>>+|♪+', _re_dictation.IGNORECASE)
+_MIN_WORDS_PER_SENTENCE = 5
+
+
+def _clean_caption_text(text: str) -> str:
+    """Loai bo cac ky hieu rac cua phu de tu dong: [Music], [Applause], >>, ♪..."""
+    text = _CAPTION_NOISE_RE.sub(' ', text)
+    text = _re_dictation.sub(r'\s+', ' ', text).strip()
+    return text
+
+
 def _build_word_timeline(transcript):
     timeline = []
     for seg in transcript:
-        text = seg["text"].replace("\n", " ").strip()
+        text = _clean_caption_text(seg["text"].replace("\n", " "))
         if not text:
             continue
         words = text.split()
@@ -987,7 +998,7 @@ def _build_word_timeline(transcript):
     return timeline
 
 
-def _split_into_sentences(timeline):
+def _split_into_sentences(timeline, min_words=_MIN_WORDS_PER_SENTENCE):
     sentences = []
     buffer = []
     sent_start = None
@@ -996,6 +1007,9 @@ def _split_into_sentences(timeline):
             sent_start = item["time"]
         buffer.append(item)
         if _re_dictation.search(r'[.?!]["\')]*$', item["word"]):
+            # Neu cau qua ngan (duoi min_words tu), khong cat - gop tiep vao cau ke tiep
+            if len(buffer) < min_words:
+                continue
             text = " ".join(w["word"] for w in buffer)
             end_time = item["time"] + 1.2  # them dem de audio khong bi cat ngang tu cuoi
             sentences.append({"text": text, "start_time": round(sent_start, 2), "end_time": round(end_time, 2)})
