@@ -14,6 +14,7 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # dung rieng cho /lookup, tach biet quota voi HF_TOKEN
 
 # ---------------------------------------------------------------------------
 # Supabase setup (Auth + Postgres + Storage)
@@ -525,6 +526,79 @@ def chat(req: ChatRequest):
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
         return {"reply": raw}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Công cụ dịch/tra cứu ngữ liệu (bôi đen văn bản để tra) — mien phi, dung chung Qwen3-32B
+# ---------------------------------------------------------------------------
+class LookupRequest(BaseModel):
+    text: str
+
+
+@app.post("/lookup")
+def lookup_text(req: LookupRequest):
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Không có văn bản để tra cứu")
+    if len(text) > 300:
+        raise HTTPException(status_code=400, detail="Đoạn bôi đen quá dài, chỉ tra tối đa khoảng 300 ký tự")
+
+    word_count = len(text.split())
+    is_phrase = word_count > 1
+
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+
+    if not is_phrase:
+        system_prompt = """Bạn là từ điển Anh-Việt chuyên nghiệp, viết theo đúng văn phong của Cambridge Dictionary / Oxford Dictionary.
+Cho 1 từ tiếng Anh, trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào khác, không dùng markdown:
+{
+  "word": "từ gốc",
+  "part_of_speech": "noun/verb/adjective/adverb/... (để trống nếu không xác định được)",
+  "vietnamese_meaning": "nghĩa tiếng Việt ngắn gọn, chính xác, đúng ngữ cảnh phổ biến nhất",
+  "english_definition": "định nghĩa tiếng Anh 1 câu, rõ ràng, đúng phong cách từ điển học thuật",
+  "synonyms": ["1-2 từ đồng nghĩa"],
+  "antonyms": ["1-2 từ trái nghĩa, mảng rỗng [] nếu từ này không có trái nghĩa rõ ràng"]
+}"""
+        user_msg = f'Từ cần tra: "{text}"'
+        max_tokens = 350
+    else:
+        system_prompt = """Bạn là công cụ dịch Anh-Việt chuyên nghiệp.
+Cho 1 cụm từ hoặc câu tiếng Anh, dịch sang tiếng Việt tự nhiên, chính xác, giữ đúng nghĩa và sắc thái.
+Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào khác, không dùng markdown:
+{
+  "original": "văn bản gốc",
+  "translation": "bản dịch tiếng Việt tự nhiên"
+}"""
+        user_msg = f'Dịch đoạn sau sang tiếng Việt: "{text}"'
+        max_tokens = 400
+
+    try:
+        response = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=max_tokens,
+            reasoning_effort="none",
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        result = json.loads(raw.strip())
+        result["is_phrase"] = is_phrase
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
