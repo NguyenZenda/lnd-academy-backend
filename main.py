@@ -1352,6 +1352,7 @@ Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào k
   "words": [
     {
       "word": "từ gốc (dạng từ điển, không chia)",
+      "part_of_speech": "noun/verb/adjective/adverb/... (viết tắt kiểu từ điển: n., v., adj., adv.)",
       "cefr_level": "B1 hoặc B2 hoặc C1 hoặc C2",
       "english_meaning": "định nghĩa tiếng Anh ngắn gọn",
       "vietnamese_meaning": "nghĩa tiếng Việt",
@@ -1436,6 +1437,7 @@ def delete_vocab_folder(folder_id: str, user=Depends(get_current_user)):
 class VocabWordCreate(BaseModel):
     folder_id: str
     word: str
+    part_of_speech: Optional[str] = None
     cefr_level: Optional[str] = None
     english_meaning: Optional[str] = None
     vietnamese_meaning: Optional[str] = None
@@ -1459,6 +1461,7 @@ def save_vocab_word(req: VocabWordCreate, user=Depends(get_current_user)):
         "folder_id": req.folder_id,
         "user_id": user["id"],
         "word": req.word,
+        "part_of_speech": req.part_of_speech,
         "cefr_level": req.cefr_level,
         "english_meaning": req.english_meaning,
         "vietnamese_meaning": req.vietnamese_meaning,
