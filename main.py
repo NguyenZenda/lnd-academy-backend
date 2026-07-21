@@ -579,13 +579,13 @@ Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào k
 
     try:
         response = client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=max_tokens,
-            reasoning_effort="none",
+            reasoning_effort="low",
         )
         raw = response.choices[0].message.content.strip()
         raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
@@ -1363,13 +1363,13 @@ Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào k
 
     try:
         response = client.chat.completions.create(
-            model="qwen/qwen3-32b",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=2000,
-            reasoning_effort="none",
+            reasoning_effort="low",
         )
         raw = response.choices[0].message.content.strip()
         raw = _re_dictation.sub(r'<think>.*?</think>', '', raw, flags=_re_dictation.DOTALL).strip()
