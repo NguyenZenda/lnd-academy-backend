@@ -619,6 +619,11 @@ def require_admin(user):
         raise HTTPException(status_code=403, detail="Chỉ admin mới được thực hiện thao tác này")
 
 
+def require_teacher_or_admin(user):
+    if user["role"] not in ("teacher", "admin"):
+        raise HTTPException(status_code=403, detail="Chỉ giáo viên hoặc admin mới được thực hiện thao tác này")
+
+
 class ExamQuestionIn(BaseModel):
     question_number: int
     question_type: str  # "mcq" | "short_answer"
@@ -639,7 +644,7 @@ async def parse_exam(
 ):
     """Trich xuat text tho tu file docx, KHONG dung AI, KHONG tu doan cau hoi/dap an.
     Admin tu nhap tung cau hoi + dap an thu cong o buoc sau."""
-    require_admin(user)
+    require_teacher_or_admin(user)
     if skill not in ("reading", "listening"):
         raise HTTPException(status_code=400, detail="Kỹ năng không hợp lệ")
     if not (file.filename or "").lower().endswith(".docx"):
@@ -712,7 +717,7 @@ def _get_drive_service():
 
 @app.post("/exams/upload-audio")
 async def upload_exam_audio(file: UploadFile = File(...), user=Depends(get_current_user)):
-    require_admin(user)
+    require_teacher_or_admin(user)
     if not (file.filename or "").lower().endswith((".mp3", ".wav", ".m4a", ".ogg")):
         raise HTTPException(status_code=400, detail="Chỉ hỗ trợ file âm thanh (.mp3, .wav, .m4a, .ogg)")
     if not AUDIO_DRIVE_FOLDER_ID:
@@ -796,7 +801,7 @@ def _insert_parts_groups_questions(exam_id, req):
 
 @app.post("/exams")
 def create_exam(req: ExamCreateRequest, user=Depends(get_current_user)):
-    require_admin(user)
+    require_teacher_or_admin(user)
     if req.skill not in ("reading", "listening"):
         raise HTTPException(status_code=400, detail="Kỹ năng không hợp lệ")
     if not req.questions:
@@ -853,7 +858,7 @@ def get_exam(exam_id: str):
 @app.get("/exams/{exam_id}/edit")
 def get_exam_for_edit(exam_id: str, user=Depends(get_current_user)):
     """Giong get_exam nhung KHONG an dap an - chi admin dung de sua de thi."""
-    require_admin(user)
+    require_teacher_or_admin(user)
     exam = supabase.table("exams").select("*").eq("id", exam_id).single().execute()
     if not exam.data:
         raise HTTPException(status_code=404, detail="Không tìm thấy đề thi")
@@ -874,7 +879,7 @@ def get_exam_for_edit(exam_id: str, user=Depends(get_current_user)):
 
 @app.put("/exams/{exam_id}")
 def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_user)):
-    require_admin(user)
+    require_teacher_or_admin(user)
     if req.skill not in ("reading", "listening"):
         raise HTTPException(status_code=400, detail="Kỹ năng không hợp lệ")
     if not req.questions:
@@ -904,7 +909,7 @@ def update_exam(exam_id: str, req: ExamCreateRequest, user=Depends(get_current_u
 
 @app.delete("/exams/{exam_id}")
 def delete_exam(exam_id: str, user=Depends(get_current_user)):
-    require_admin(user)
+    require_teacher_or_admin(user)
     supabase.table("exam_questions").delete().eq("exam_id", exam_id).execute()
     supabase.table("exam_groups").delete().eq("exam_id", exam_id).execute()
     supabase.table("exam_parts").delete().eq("exam_id", exam_id).execute()
