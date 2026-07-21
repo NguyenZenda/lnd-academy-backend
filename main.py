@@ -1442,6 +1442,14 @@ class VocabWordCreate(BaseModel):
     common_phrases: Optional[List[str]] = None
 
 
+@app.get("/vocab/words")
+def list_all_my_words(user=Depends(get_current_user)):
+    return (
+        supabase.table("saved_vocab_words").select("*, vocab_folders(name)")
+        .eq("user_id", user["id"]).order("created_at", desc=True).execute().data
+    )
+
+
 @app.post("/vocab/words")
 def save_vocab_word(req: VocabWordCreate, user=Depends(get_current_user)):
     folder = supabase.table("vocab_folders").select("id").eq("id", req.folder_id).eq("user_id", user["id"]).execute()
