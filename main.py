@@ -1302,3 +1302,170 @@ def list_my_dictation_attempts(user=Depends(get_current_user)):
         .execute().data
     )
     return attempts
+
+
+# ---------------------------------------------------------------------------
+# Key Vocab: tu dong trich tu vung B1+ tu bai doc/nghe/dictation (dung Groq, co cache)
+# ---------------------------------------------------------------------------
+class KeyVocabRequest(BaseModel):
+    source_type: str  # "reading_passage" | "listening_transcript" | "dictation"
+    source_id: str
+    text: str
+
+
+@app.post("/key-vocab/extract")
+def extract_key_vocab(req: KeyVocabRequest):
+    require_supabase()
+
+    cached = (
+        supabase.table("key_vocab_cache")
+        .select("words")
+        .eq("source_type", req.source_type)
+        .eq("source_id", req.source_id)
+        .execute()
+    )
+    if cached.data:
+        return {"words": cached.data[0]["words"]}
+
+    if not GROQ_API_KEY:
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY not configured")
+
+    plain_text = _re_dictation.sub(r'<[^>]+>', ' ', req.text)  # bo tag HTML neu co (tu rich-text editor)
+    plain_text = plain_text.strip()[:4000]
+    if len(plain_text) < 20:
+        return {"words": []}
+
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+
+    system_prompt = """Bạn là chuyên gia phân tích từ vựng tiếng Anh theo khung CEFR.
+Cho đoạn văn bản tiếng Anh dưới đây, xác định các từ vựng KHÓ (chỉ lấy CEFR từ B1 trở lên: B1, B2, C1, C2) — bỏ qua tên riêng, số, và các từ cơ bản A1/A2.
+Tối đa 15 từ quan trọng/hay gặp nhất trong bài (không cần liệt kê hết nếu bài dài).
+
+Trả lời CHỈ theo đúng định dạng JSON sau, không thêm chữ nào khác, không dùng markdown:
+{
+  "words": [
+    {
+      "word": "từ gốc (dạng từ điển, không chia)",
+      "cefr_level": "B1 hoặc B2 hoặc C1 hoặc C2",
+      "english_meaning": "định nghĩa tiếng Anh ngắn gọn",
+      "vietnamese_meaning": "nghĩa tiếng Việt",
+      "common_phrases": ["1-2 cụm từ/collocation phổ biến có chứa từ này"]
+    }
+  ]
+}"""
+    user_msg = f"Văn bản:\n{plain_text}"
+
+    try:
+        response = client.chat.completions.create(
+            model="qwen/qwen3-32b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=2000,
+            reasoning_effort="none",
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = _re_dictation.sub(r'<think>.*?</think>', '', raw, flags=_re_dictation.DOTALL).strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        match = _re_dictation.search(r'\{.*\}', raw, _re_dictation.DOTALL)
+        if match:
+            raw = match.group(0)
+        result = json.loads(raw.strip())
+        words = result.get("words", [])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi khi trích xuất từ vựng: {e}")
+
+    try:
+        supabase.table("key_vocab_cache").insert({
+            "source_type": req.source_type,
+            "source_id": req.source_id,
+            "words": words,
+        }).execute()
+    except Exception:
+        pass  # neu luu cache loi (vd trung key) thi van tra ket qua binh thuong
+
+    return {"words": words}
+
+
+# ---------------------------------------------------------------------------
+# Tu vung ca nhan: thu muc + tu da luu (yeu cau dang nhap)
+# ---------------------------------------------------------------------------
+class VocabFolderCreate(BaseModel):
+    name: str
+
+
+@app.get("/vocab/folders")
+def list_vocab_folders(user=Depends(get_current_user)):
+    return (
+        supabase.table("vocab_folders").select("*").eq("user_id", user["id"])
+        .order("created_at", desc=True).execute().data
+    )
+
+
+@app.post("/vocab/folders")
+def create_vocab_folder(req: VocabFolderCreate, user=Depends(get_current_user)):
+    if not req.name.strip():
+        raise HTTPException(status_code=400, detail="Tên thư mục không được để trống")
+    res = supabase.table("vocab_folders").insert({
+        "user_id": user["id"],
+        "name": req.name.strip(),
+    }).execute()
+    return res.data[0]
+
+
+@app.delete("/vocab/folders/{folder_id}")
+def delete_vocab_folder(folder_id: str, user=Depends(get_current_user)):
+    folder = supabase.table("vocab_folders").select("id").eq("id", folder_id).eq("user_id", user["id"]).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thư mục")
+    supabase.table("saved_vocab_words").delete().eq("folder_id", folder_id).execute()
+    supabase.table("vocab_folders").delete().eq("id", folder_id).execute()
+    return {"status": "ok"}
+
+
+class VocabWordCreate(BaseModel):
+    folder_id: str
+    word: str
+    cefr_level: Optional[str] = None
+    english_meaning: Optional[str] = None
+    vietnamese_meaning: Optional[str] = None
+    common_phrases: Optional[List[str]] = None
+
+
+@app.post("/vocab/words")
+def save_vocab_word(req: VocabWordCreate, user=Depends(get_current_user)):
+    folder = supabase.table("vocab_folders").select("id").eq("id", req.folder_id).eq("user_id", user["id"]).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thư mục")
+    res = supabase.table("saved_vocab_words").insert({
+        "folder_id": req.folder_id,
+        "user_id": user["id"],
+        "word": req.word,
+        "cefr_level": req.cefr_level,
+        "english_meaning": req.english_meaning,
+        "vietnamese_meaning": req.vietnamese_meaning,
+        "common_phrases": req.common_phrases,
+    }).execute()
+    return res.data[0]
+
+
+@app.get("/vocab/folders/{folder_id}/words")
+def list_words_in_folder(folder_id: str, user=Depends(get_current_user)):
+    folder = supabase.table("vocab_folders").select("id").eq("id", folder_id).eq("user_id", user["id"]).execute()
+    if not folder.data:
+        raise HTTPException(status_code=404, detail="Không tìm thấy thư mục")
+    return (
+        supabase.table("saved_vocab_words").select("*").eq("folder_id", folder_id)
+        .order("created_at", desc=True).execute().data
+    )
+
+
+@app.delete("/vocab/words/{word_id}")
+def delete_saved_word(word_id: str, user=Depends(get_current_user)):
+    supabase.table("saved_vocab_words").delete().eq("id", word_id).eq("user_id", user["id"]).execute()
+    return {"status": "ok"}
