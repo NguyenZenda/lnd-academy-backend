@@ -3,6 +3,7 @@ import json
 import re
 import time
 import uuid
+import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -15,6 +16,13 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")  # dung rieng cho /lookup, tach biet quota voi HF_TOKEN
+
+# Server cham bai IELTS Writing chay local tren may HP Desktop (RTX 3060, Qwen3-8B fine-tuned),
+# lo ra ngoai qua Cloudflare Tunnel. Dat trong Render Dashboard -> Environment:
+#   LOCAL_GRADE_URL      = https://xxxx-xxxx.trycloudflare.com  (link Cloudflare Tunnel hien tai)
+#   LOCAL_GRADE_API_KEY  = phai KHOP DUNG voi $env:LOCAL_GRADE_API_KEY dat khi chay grade_server.py tren may HP
+LOCAL_GRADE_URL = os.environ.get("LOCAL_GRADE_URL", "")
+LOCAL_GRADE_API_KEY = os.environ.get("LOCAL_GRADE_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Supabase setup (Auth + Postgres + Storage)
@@ -376,72 +384,37 @@ def root():
 
 @app.post("/grade")
 def grade_essay(req: GradeRequest):
-    if not HF_TOKEN:
-        raise HTTPException(status_code=500, detail="HF_TOKEN not configured")
+    if not LOCAL_GRADE_URL:
+        raise HTTPException(status_code=500, detail="LOCAL_GRADE_URL not configured")
+    if not LOCAL_GRADE_API_KEY:
+        raise HTTPException(status_code=500, detail="LOCAL_GRADE_API_KEY not configured")
     if len(req.essay.strip()) < 50:
         raise HTTPException(status_code=400, detail="Essay is too short")
 
-    client = InferenceClient(provider="nscale", api_key=HF_TOKEN)
-
-    if req.task_type == "Task 1":
-        criterion1_name = "Task Achievement (TA)"
-        descriptors = TASK1_DESCRIPTORS
-    else:
-        criterion1_name = "Task Response (TR)"
-        descriptors = TASK2_DESCRIPTORS
-
-    system_prompt = (
-        "You are a certified IELTS examiner with 10+ years of experience. "
-        "You must grade strictly and accurately following the official IELTS Band Descriptors below.\n\n"
-        + descriptors +
-        "\n\nCRITICAL RULES:\n"
-        "1. Each criterion score MUST be a WHOLE NUMBER (1-9). NEVER use decimals like 6.5 for individual criteria.\n"
-        "2. Only the overall_band can be x.0 or x.5 (calculated by averaging the 4 criteria and rounding to nearest 0.5).\n"
-        "3. Read the band descriptors carefully for EACH criterion before scoring.\n"
-        "4. Be strict and accurate — do not inflate scores.\n"
-        "5. Respond ONLY in this exact JSON format, no extra text, no markdown:\n"
-        "{\n"
-        f'  "criterion1_name": "{criterion1_name}",\n'
-        '  "criterion1_score": 6,\n'
-        '  "criterion1_feedback": "Specific feedback referencing the band descriptors...",\n'
-        '  "criterion2_name": "Coherence & Cohesion",\n'
-        '  "criterion2_score": 6,\n'
-        '  "criterion2_feedback": "Specific feedback referencing the band descriptors...",\n'
-        '  "criterion3_name": "Lexical Resource",\n'
-        '  "criterion3_score": 7,\n'
-        '  "criterion3_feedback": "Specific feedback referencing the band descriptors...",\n'
-        '  "criterion4_name": "Grammatical Range & Accuracy",\n'
-        '  "criterion4_score": 6,\n'
-        '  "criterion4_feedback": "Specific feedback referencing the band descriptors...",\n'
-        '  "overall_band": 6.5,\n'
-        '  "overall_feedback": "Comprehensive examiner feedback on the essay overall..."\n'
-        "}"
-    )
-
-    user_content = f"EXAM PROMPT:\n{req.prompt}\n\nSTUDENT ESSAY:\n{req.essay}"
-    user_message = f"Grade this IELTS Writing {req.task_type} using the official band descriptors provided:\n\n{user_content}\n/no_think"
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message}
-    ]
+    # Frontend gui "Task 1" / "Task 2", grade_server.py tren may HP nhan "task1" / "task2"
+    task_type_mapped = "task1" if req.task_type.strip().lower() == "task 1" else "task2"
 
     try:
-        response = client.chat.completions.create(
-            model="Qwen/Qwen3-32B",
-            messages=messages,
-            max_tokens=2000,
+        response = requests.post(
+            f"{LOCAL_GRADE_URL.rstrip('/')}/grade",
+            json={
+                "task_type": task_type_mapped,
+                "exam_prompt": req.prompt,
+                "student_essay": req.essay,
+                "api_key": LOCAL_GRADE_API_KEY,
+            },
+            timeout=120,
         )
-        raw = response.choices[0].message.content.strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        match = re.search(r'\{.*\}', raw, re.DOTALL)
-        if match:
-            raw = match.group(0)
-        result = json.loads(raw.strip())
+        response.raise_for_status()
+        data = response.json()
+
+        if not data.get("success"):
+            raise HTTPException(
+                status_code=500,
+                detail=data.get("error", "May cham bai khong tra ve JSON hop le"),
+            )
+
+        result = data["result"]
 
         for key in ["criterion1_score", "criterion2_score", "criterion3_score", "criterion4_score"]:
             if key in result:
@@ -453,8 +426,17 @@ def grade_essay(req: GradeRequest):
         result["overall_band"] = round(avg * 2) / 2
 
         return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(
+            status_code=504,
+            detail="May cham bai (HP Desktop) phan hoi qua lau, thu lai sau.",
+        )
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Khong ket noi duoc toi may cham bai. Kiem tra may HP va Cloudflare Tunnel co dang chay khong. Chi tiet: {str(e)}",
+        )
 
 
 # ---------------------------------------------------------------------------
