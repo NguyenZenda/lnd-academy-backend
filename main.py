@@ -382,6 +382,81 @@ def root():
     return {"status": "LND Academy API is running"}
 
 
+def _clean_feedback_text(text: str) -> str:
+    """Bo dau gach dau dong (- ) bi lan trong doan nhan xet, noi lai thanh 1 doan van lien mach."""
+    if not text:
+        return text
+    # Dau "-" ngay sau dau cham cau (VD "... task. - However ...") -> bo dau gach, giu dau cham
+    text = re.sub(r'([.!?])\s*-\s+', r'\1 ', text)
+    # Dau "-" o dau dong moi (that su xuong dong \n- ...) -> thay bang khoang trang
+    text = re.sub(r'(?:^|\n)\s*-\s+', ' ', text)
+    # Gop nhieu dong/khoang trang thanh 1 doan van lien mach
+    text = re.sub(r'\s*\n+\s*', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text)
+    return text.strip()
+
+
+def _translate_feedback_to_vietnamese(result: dict) -> dict:
+    """Dich 4 nhan xet tieu chi sang tieng Viet (thay the), va tao ban dich rieng cho overall_feedback
+    (giu nguyen ban tieng Anh, them truong overall_feedback_vi ben canh)."""
+    if not GROQ_API_KEY:
+        return result  # khong co Groq key thi bo qua, giu nguyen tieng Anh
+
+    from groq import Groq
+    client = Groq(api_key=GROQ_API_KEY)
+
+    system_prompt = """Bạn là dịch giả chuyên nghiệp Anh-Việt, chuyên dịch nhận xét chấm bài IELTS Writing.
+Dịch các đoạn nhận xét sau sang tiếng Việt tự nhiên, đúng văn phong học thuật, giữ đúng ý nghĩa
+(không dịch máy móc từng chữ). Trả lời CHỈ theo đúng JSON sau, không thêm chữ nào khác, không dùng markdown:
+{
+  "criterion1_feedback_vi": "...",
+  "criterion2_feedback_vi": "...",
+  "criterion3_feedback_vi": "...",
+  "criterion4_feedback_vi": "...",
+  "overall_feedback_vi": "..."
+}"""
+    user_msg = json.dumps({
+        "criterion1_feedback": result.get("criterion1_feedback", ""),
+        "criterion2_feedback": result.get("criterion2_feedback", ""),
+        "criterion3_feedback": result.get("criterion3_feedback", ""),
+        "criterion4_feedback": result.get("criterion4_feedback", ""),
+        "overall_feedback": result.get("overall_feedback", ""),
+    }, ensure_ascii=False)
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=2000,
+            reasoning_effort="low",
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL).strip()
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if match:
+            raw = match.group(0)
+        vi = json.loads(raw.strip())
+
+        # Thay the 4 nhan xet tieu chi bang ban tieng Viet
+        for i in range(1, 5):
+            key = f"criterion{i}_feedback_vi"
+            if vi.get(key):
+                result[f"criterion{i}_feedback"] = vi[key]
+        # overall_feedback GIU NGUYEN tieng Anh, chi them ban dich rieng ben canh
+        result["overall_feedback_vi"] = vi.get("overall_feedback_vi", "")
+    except Exception:
+        pass  # neu dich loi, giu nguyen ban tieng Anh, khong lam gian doan viec cham bai
+
+    return result
+
+
 @app.post("/grade")
 def grade_essay(req: GradeRequest):
     if not LOCAL_GRADE_URL:
@@ -424,6 +499,13 @@ def grade_essay(req: GradeRequest):
                   result["criterion3_score"], result["criterion4_score"]]
         avg = sum(scores) / 4
         result["overall_band"] = round(avg * 2) / 2
+
+        for key in ["criterion1_feedback", "criterion2_feedback", "criterion3_feedback",
+                    "criterion4_feedback", "overall_feedback"]:
+            if key in result:
+                result[key] = _clean_feedback_text(result[key])
+
+        result = _translate_feedback_to_vietnamese(result)
 
         return result
 
